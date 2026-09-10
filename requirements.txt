@@ -1,0 +1,7 @@
+﻿fastapi
+uvicorn
+supabase
+python-docx
+pypdf
+pydantic
+python-multipart
