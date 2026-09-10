@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import json
@@ -141,6 +142,11 @@ def parse_text_to_questions(text_content: str, is_html: bool = False) -> List[Di
 
 
 # API Endpoints
+
+@app.get("/")
+def read_root():
+    return RedirectResponse(url="/docs")
+
 
 @app.post("/api/login")
 def login_user(data: LoginRequest):
