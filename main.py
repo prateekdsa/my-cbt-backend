@@ -7,13 +7,19 @@ import json
 import io
 import re
 import os
-from supabase import create_client, Client
 
 # Document parsing libraries
-from docx import Document
-from pypdf import PdfReader
+try:
+    from docx import Document
+except ImportError:
+    Document = None
 
-app = FastAPI(title="City Public School Secure CBT Backend", version="6.2")
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+app = FastAPI(title="City Public School Secure CBT Backend", version="6.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,14 +29,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Supabase Client securely from environment variables
+# Safe Supabase Initialization (Prevents Serverless Startup Crashes)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise ValueError("Missing Supabase environment variables. Ensure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set.")
+supabase = None
+try:
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        from supabase import create_client, Client
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+except Exception as e:
+    print(f"Supabase initialization error: {e}")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+def get_db():
+    if not supabase:
+        raise HTTPException(
+            status_code=500, 
+            detail="Supabase client is not initialized. Please ensure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are correctly configured in Vercel Environment Variables and redeploy."
+        )
+    return supabase
 
 # Pydantic Schemas
 class LoginRequest(BaseModel):
@@ -122,8 +139,7 @@ def parse_text_to_questions(text_content: str, is_html: bool = False) -> List[Di
             current_case_study += "<br>" + (raw_html or text)
 
     if is_html:
-        lines = text_content.split('\n')
-        for line in lines:
+        for line in text_content.split('\n'):
             process_line(line, line)
     else:
         for line in text_content.split('\n'):
@@ -150,16 +166,16 @@ def read_root():
 
 @app.post("/api/login")
 def login_user(data: LoginRequest):
+    db = get_db()
     username = data.username.strip().lower()
     
-    # Check Admin fallback or look up in DB
     if username == "admin" and data.password == "Admin@2511":
-        res = supabase.table("users").select("*").eq("role", "Admin").execute()
+        res = db.table("users").select("*").eq("role", "Admin").execute()
         if res.data:
             return {"success": True, "user": res.data[0]}
         return {"success": True, "user": { "id": 1, "role": "Admin", "class": "N/A", "subject": "All", "name": "ADMINISTRATOR", "username": "admin", "status": "approved" }}
 
-    res = supabase.table("users").select("*").eq("username", username).execute()
+    res = db.table("users").select("*").eq("username", username).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="User not found.")
     
@@ -171,14 +187,14 @@ def login_user(data: LoginRequest):
         raise HTTPException(status_code=403, detail="Account is locked due to security violations or multi-device login.")
 
     if user["role"] == "Student":
-        session_res = supabase.table("active_sessions").select("*").eq("username", username).execute()
+        session_res = db.table("active_sessions").select("*").eq("username", username).execute()
         if session_res.data:
-            supabase.table("users").update({"status": "locked"}).eq("username", username).execute()
+            db.table("users").update({"status": "locked"}).eq("username", username).execute()
             raise HTTPException(status_code=403, detail="Multiple session detected. Account locked.")
         
-        supabase.table("active_sessions").upsert({"username": username, "active": True}).execute()
+        db.table("active_sessions").upsert({"username": username, "active": True}).execute()
         if data.class_name:
-            supabase.table("users").update({"class": data.class_name}).eq("username", username).execute()
+            db.table("users").update({"class": data.class_name}).eq("username", username).execute()
             user["class"] = data.class_name
 
     return {"success": True, "user": user}
@@ -186,7 +202,8 @@ def login_user(data: LoginRequest):
 
 @app.post("/api/register")
 def register_user(data: RegisterRequest):
-    existing = supabase.table("users").select("username").eq("username", data.username.lower()).execute()
+    db = get_db()
+    existing = db.table("users").select("username").eq("username", data.username.lower()).execute()
     if existing.data:
         raise HTTPException(status_code=400, detail="Username already exists.")
 
@@ -201,13 +218,14 @@ def register_user(data: RegisterRequest):
         "roll": data.roll if data.role == "Student" else None,
         "status": status_val
     }
-    supabase.table("users").insert(new_user_data).execute()
+    db.table("users").insert(new_user_data).execute()
     return {"success": True, "message": "Registration successful", "status": status_val}
 
 
 @app.get("/api/exams")
 def get_exams(class_name: Optional[str] = None):
-    res = supabase.table("exams").select("*").execute()
+    db = get_db()
+    res = db.table("exams").select("*").execute()
     exams = res.data or []
     if class_name:
         return [e for e in exams if e.get("class") == class_name or e.get("class") == "All Sections"]
@@ -224,6 +242,7 @@ async def upload_question_paper(
     target_classes: str = Form(...),
     file: UploadFile = File(...)
 ):
+    db = get_db()
     classes_list = json.loads(target_classes)
     content_bytes = await file.read()
     filename = file.filename.lower()
@@ -234,18 +253,18 @@ async def upload_question_paper(
         parsed_questions = json.loads(content_bytes.decode('utf-8'))
     elif filename.endswith('.txt'):
         parsed_questions = parse_text_to_questions(content_bytes.decode('utf-8'), False)
-    elif filename.endswith('.docx') or filename.endswith('.doc'):
+    elif (filename.endswith('.docx') or filename.endswith('.doc')) and Document:
         doc = Document(io.BytesIO(content_bytes))
         full_text = "\n".join([p.text for p in doc.paragraphs])
         parsed_questions = parse_text_to_questions(full_text, False)
-    elif filename.endswith('.pdf'):
+    elif filename.endswith('.pdf') and PdfReader:
         reader = PdfReader(io.BytesIO(content_bytes))
         full_text = ""
         for page in reader.pages:
             full_text += (page.extract_text() or "") + "\n"
         parsed_questions = parse_text_to_questions(full_text, False)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file format.")
+        raise HTTPException(status_code=400, detail="Unsupported file format or required parser library missing.")
 
     for cls in classes_list:
         exam_id = f"{subject_id}_{cls.lower().replace(' ', '')}"
@@ -261,19 +280,20 @@ async def upload_question_paper(
             "duration_minutes": duration,
             "questions": parsed_questions
         }
-        supabase.table("exams").upsert(exam_payload).execute()
+        db.table("exams").upsert(exam_payload).execute()
 
     return {"success": True, "message": f"Successfully assigned question paper to {len(classes_list)} classes."}
 
 
 @app.post("/api/submit-exam")
 def submit_exam(data: SubmissionRequest):
-    exam_res = supabase.table("exams").select("*").eq("id", data.exam_id).execute()
+    db = get_db()
+    exam_res = db.table("exams").select("*").eq("id", data.exam_id).execute()
     if not exam_res.data:
         raise HTTPException(status_code=404, detail="Exam not found.")
     exam = exam_res.data[0]
 
-    user_res = supabase.table("users").select("*").eq("username", data.username.lower()).execute()
+    user_res = db.table("users").select("*").eq("username", data.username.lower()).execute()
     if not user_res.data:
         raise HTTPException(status_code=404, detail="User not found.")
     user = user_res.data[0]
@@ -304,17 +324,16 @@ def submit_exam(data: SubmissionRequest):
         "answers": data.answers,
         "graded_marks": {}
     }
-    supabase.table("submissions").insert(submission_payload).execute()
-    
-    # Clear active session lock
-    supabase.table("active_sessions").delete().eq("username", data.username.lower()).execute()
+    db.table("submissions").insert(submission_payload).execute()
+    db.table("active_sessions").delete().eq("username", data.username.lower()).execute()
 
     return {"success": True, "score": score_str}
 
 
 @app.get("/api/submissions")
 def get_submissions(class_name: Optional[str] = None, subject: Optional[str] = None):
-    res = supabase.table("submissions").select("*").execute()
+    db = get_db()
+    res = db.table("submissions").select("*").execute()
     results = res.data or []
     if class_name and class_name != "ALL":
         results = [s for s in results if s.get("class") == class_name]
@@ -325,7 +344,8 @@ def get_submissions(class_name: Optional[str] = None, subject: Optional[str] = N
 
 @app.post("/api/grade-descriptive")
 def grade_descriptive(data: GradeRequest):
-    sub_res = supabase.table("submissions").select("*").eq("id", data.submission_id).execute()
+    db = get_db()
+    sub_res = db.table("submissions").select("*").eq("id", data.submission_id).execute()
     if not sub_res.data:
         raise HTTPException(status_code=404, detail="Submission not found.")
     
@@ -333,17 +353,18 @@ def grade_descriptive(data: GradeRequest):
     graded_marks = sub.get("graded_marks") or {}
     graded_marks[str(data.question_id)] = data.grade
     
-    supabase.table("submissions").update({"graded_marks": graded_marks}).eq("id", data.submission_id).execute()
+    db.table("submissions").update({"graded_marks": graded_marks}).eq("id", data.submission_id).execute()
     return {"success": True, "message": "Grade saved successfully."}
 
 
 @app.post("/api/users/unlock")
 def unlock_user(username: str = Form(...)):
-    user_res = supabase.table("users").select("*").eq("username", username.lower()).execute()
+    db = get_db()
+    user_res = db.table("users").select("*").eq("username", username.lower()).execute()
     if not user_res.data:
         raise HTTPException(status_code=404, detail="User not found.")
     user = user_res.data[0]
 
-    supabase.table("users").update({"status": "approved"}).eq("username", username.lower()).execute()
-    supabase.table("active_sessions").delete().eq("username", username.lower()).execute()
+    db.table("users").update({"status": "approved"}).eq("username", username.lower()).execute()
+    db.table("active_sessions").delete().eq("username", username.lower()).execute()
     return {"success": True, "message": f"User {user['name']} unlocked successfully."}
