@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-pydantic
-python-multipart
-python-docx
-pypdf
-supabase
